@@ -1,0 +1,40 @@
+# Traefik routes (แก้แล้ว Traefik reload เอง ไม่ต้อง restart)
+http:
+  routers:
+    api:
+      rule: Host(`app.liu-shu.com`) && PathPrefix(`/api`)
+      entryPoints: [web]
+      priority: 10
+      service: api
+      # ถ้า route ใน Elysia ไม่ได้ขึ้นต้นด้วย /api ให้เปิดบรรทัดนี้
+      # middlewares: [strip-api]
+
+    client:
+      rule: Host(`app.liu-shu.com`)
+      entryPoints: [web]
+      priority: 1
+      service: client
+
+    s3:
+      rule: Host(`s3.liu-shu.com`)
+      entryPoints: [web]
+      service: s3
+
+  middlewares:
+    strip-api:
+      stripPrefix:
+        prefixes: [/api]
+
+  services:
+    api:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:3000
+    client:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:4173
+    s3:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:3900

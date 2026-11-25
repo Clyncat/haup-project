@@ -1,0 +1,207 @@
+# =============================================================================
+# haup — application stack
+#   Infra: Traefik (gateway) + Garage (S3) + PostgreSQL
+#   Apps:  client (nginx serving the Vite build) + service (Elysia API)
+#
+# Traffic flow:
+#   Internet → Cloudflare (TLS) → cloudflared (host, systemd) → Traefik 127.0.0.1:8081
+#     ├─ app.liu-shu.com /api/*  → 127.0.0.1:3000  (service: Elysia)
+#     ├─ app.liu-shu.com /*      → 127.0.0.1:4173  (client: nginx, serves client/dist)
+#     └─ s3.liu-shu.com          → 127.0.0.1:3900  (garage: S3 API)
+#
+# Security model:
+#   Every port binds to 127.0.0.1 only. The sole public entry point is the
+#   Cloudflare Tunnel; nothing is reachable from the LAN or the internet directly.
+#
+# First-time setup:
+#   ./bin/gen-env.sh            # generate .env with random secrets
+#   docker compose up -d
+#   ./bin/garage-init.sh        # create Garage layout, bucket and access key (idempotent)
+#   ./bin/smoke-test.sh --public
+#
+# Deploy:
+#   client:  (cd client  && npm run build)                                   # live instantly
+#   service: (cd service && npm run build) && docker compose restart service
+# =============================================================================
+
+name: haup-infra
+
+services:
+  # ---------------------------------------------------------------------------
+  # Traefik — reverse proxy / API gateway
+  # ---------------------------------------------------------------------------
+  traefik:
+    # Docker Engine 29+ requires Traefik >= 3.6.1 (older versions use a Docker
+    # API version that Engine 29 rejects). Pin a minor version in production,
+    # e.g. traefik:v3.6, to avoid surprise upgrades.
+    image: traefik:v3
+    restart: unless-stopped
+    # Host networking lets Traefik reach backends via 127.0.0.1 — both host
+    # processes and containers that publish on loopback.
+    network_mode: host
+    command:
+      - --log.level=INFO
+      - --accesslog=true
+      - --ping=true # enables /ping for the healthcheck below
+
+      # Dashboard on the internal "traefik" entrypoint, localhost only.
+      # Access it through an SSH tunnel: ssh -L 8080:localhost:8080 wipay-server
+      - --api.dashboard=true
+      - --api.insecure=true
+      - --entrypoints.traefik.address=127.0.0.1:8080
+
+      # Public HTTP entrypoint — cloudflared forwards here.
+      # TLS is terminated at Cloudflare, so plain HTTP is fine on loopback.
+      # Not port 80: k3s on this host DNATs :80/:443 to its bundled Traefik
+      # (ServiceLB/iptables), which intercepts traffic even on 127.0.0.1.
+      - --entrypoints.web.address=127.0.0.1:8081
+      # Trust X-Forwarded-* headers: the only client of this port is cloudflared.
+      - --entrypoints.web.forwardedHeaders.insecure=true
+
+      # Routes live in a file (not Docker labels) because backends are addressed
+      # by loopback port. The file is hot-reloaded on change.
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --providers.file.watch=true
+    volumes:
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "traefik",
+          "healthcheck",
+          "--ping",
+          "--entrypoints.traefik.address=127.0.0.1:8080",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Garage — S3-compatible object storage (single node)
+  # Docs: https://garagehq.deuxfleurs.fr/documentation/
+  # ---------------------------------------------------------------------------
+  garage:
+    # Pin an exact version: Garage major upgrades may require a migration.
+    image: dxflrs/garage:v2.2.0
+    restart: unless-stopped
+    # Secrets are injected via env rather than written to garage.toml,
+    # so the config file can be committed safely.
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:?set in .env}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:?set in .env}
+      GARAGE_METRICS_TOKEN: ${GARAGE_METRICS_TOKEN:?set in .env}
+    ports:
+      - "127.0.0.1:3900:3900" # S3 API (used by the service, proxied by Traefik)
+      - "127.0.0.1:3903:3903" # Admin API / metrics (never expose publicly)
+    volumes:
+      - ./garage/garage.toml:/etc/garage.toml:ro
+      # Metadata is small but critical (LMDB) — ideally keep it on fast storage
+      # (SSD). Data holds the object blocks and can live on larger disks.
+      # Back up both directories together.
+      - ./data/garage/meta:/var/lib/garage/meta
+      - ./data/garage/data:/var/lib/garage/data
+    healthcheck:
+      # The image has no shell, so call the binary directly (exec form).
+      test: ["CMD", "/garage", "status"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — primary database
+  # ---------------------------------------------------------------------------
+  postgres:
+    # Pin the major version: upgrading across majors needs pg_upgrade or a
+    # dump/restore and cannot be done by just changing the tag.
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+    ports:
+      # Localhost only — connect remotely via SSH tunnel:
+      #   ssh -L 5432:localhost:5432 wipay-server
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # Postgres 18+ images store data under /var/lib/postgresql/<major>/docker,
+      # so mount the parent directory (not /var/lib/postgresql/data as in <=17).
+      - ./data/postgres:/var/lib/postgresql
+    # Docker's default 64 MB /dev/shm is too small for parallel queries.
+    shm_size: 256mb
+    healthcheck:
+      # $$ escapes Compose interpolation so the variables expand inside the container.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # client — static file server for the Vite build (replaces `vite preview`)
+  # ---------------------------------------------------------------------------
+  client:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4173:80" # Traefik routes app.liu-shu.com/* here
+    volumes:
+      # Bind-mount the build output: `npm run build` updates the site instantly,
+      # no container restart needed. Build at least once before the first `up`,
+      # otherwise Docker creates client/dist owned by root.
+      - ./client/dist:/usr/share/nginx/html:ro
+      - ./nginx/client.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      # nginx:alpine ships busybox wget; --spider = request without downloading
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # service — Elysia API, runs the compiled build from ./service/dist
+  # ---------------------------------------------------------------------------
+  service:
+    # Debian-based (glibc) to match the Ubuntu host, so node_modules installed
+    # on the host (including native addons) run unchanged in the container.
+    # Keep the major version in sync with the host's Node.
+    image: node:26-slim
+    restart: unless-stopped
+    init: true # forward signals (graceful shutdown) and reap zombie processes
+    # Host network: reach Postgres/Garage via 127.0.0.1 and listen on
+    # 127.0.0.1:3000, exactly as when running `npm start` on the host.
+    network_mode: host
+    working_dir: /app
+    # Run as the host user, not root. Check yours with `id -u` / `id -g`.
+    user: "1000:1000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+    env_file:
+      # DATABASE_URL, S3_* — copy from the output of ./bin/gen-env.sh
+      - path: ./service/.env
+        required: false
+    volumes:
+      # Read-only: the container only executes code, never modifies it.
+      - ./service:/app:ro
+    command: ["node", "dist/index.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      garage:
+        condition: service_healthy
+    healthcheck:
+      # node:slim has no curl/wget — use Node's built-in fetch.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
