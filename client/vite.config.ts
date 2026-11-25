@@ -10,10 +10,12 @@ export default defineConfig({
       "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
-  preview: {
-    host: "127.0.0.1", // IPv4 explicitly, to match Traefik's target
-    port: 4173,
-    strictPort: true, // fail instead of silently switching to another port
-    allowedHosts: ["app.liu-shu.com"], // accept the Host header coming through Traefik
+  server: {
+    host: "100.107.153.101",
+    port: 5173,
+    strictPort: true,
+    proxy: {
+      "/api": "http://127.0.0.1:3000",
+    },
   },
 });
