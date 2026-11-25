@@ -11,6 +11,12 @@ export const carApi = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     }),
+  update: (id: string, body: Partial<CreateCarBody>) =>
+    http<Car>(`/cars/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   uploadImage: (id: string, file: File) => {
     const form = new FormData();
     form.append("file", file);

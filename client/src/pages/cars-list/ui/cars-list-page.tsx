@@ -4,6 +4,7 @@ import { HugeiconsIcon } from "@hugeicons/react";
 import { Alert02Icon, Car01Icon } from "@hugeicons/core-free-icons";
 import { CAR_QUERIES, CarCard } from "@/entities/car";
 import { DeleteCarButton } from "@/features/delete-car";
+import { EditCarButton } from "@/features/update-car";
 import { Button } from "@/shared/ui/button";
 import { Skeleton } from "@/shared/ui/skeleton";
 import {
@@ -73,9 +74,13 @@ export function CarsListPage() {
         <div className={GRID}>
           {cars.map((car) => (
             <CarCard
-              key={car.id}
               car={car}
-              actions={<DeleteCarButton car={car} />}
+              actions={
+                <div className="flex gap-2">
+                  <EditCarButton car={car} />
+                  <DeleteCarButton car={car} />
+                </div>
+              }
             />
           ))}
         </div>
