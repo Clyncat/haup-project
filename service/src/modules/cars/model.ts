@@ -19,3 +19,13 @@ export type Car = CreateCar & {
   created_at: Date;
   updated_at: Date;
 };
+
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
+const IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
+
+export const uploadImageBody = z.object({
+  file: z
+    .instanceof(File)
+    .refine((f) => IMAGE_TYPES.includes(f.type), "only jpeg, png or webp")
+    .refine((f) => f.size <= MAX_IMAGE_SIZE, "image must be 5MB or smaller"),
+});
